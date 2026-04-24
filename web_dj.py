@@ -155,6 +155,59 @@ class ScriptGenerator:
 
         return self._template(title, artist)
 
+    async def resolve(self, title: str, artist: str) -> tuple:
+        """用 LLM 从模糊输入猜出完整歌名和歌手，模板模式直接原样返回。"""
+        mode = CFG["llm_mode"]
+        if mode == "template":
+            return title, artist
+
+        prompt = (
+            f"用户想听一首歌，输入的信息可能不完整或有误：\n"
+            f"歌名：{title}\n"
+            f"歌手：{artist}\n\n"
+            f"请识别这最可能是哪首歌，只返回纯 JSON，格式：\n"
+            f'{{\"title\": \"完整歌名\", \"artist\": \"完整歌手名\"}}\n'
+            f"不要任何其他内容，不要 markdown 代码块。"
+        )
+
+        raw = ""
+        if mode == "ollama" and _ollama:
+            try:
+                r = _ollama.chat(model=CFG["llm_model"],
+                                 messages=[{"role": "user", "content": prompt}])
+                raw = r["message"]["content"].strip()
+            except Exception as e:
+                log.warning(f"resolve ollama 失败: {e}")
+
+        elif mode == "api" and CFG.get("api_url"):
+            try:
+                import httpx
+                url = CFG["api_url"].rstrip("/") + "/chat/completions"
+                async with httpx.AsyncClient(timeout=15.0) as c:
+                    r = await c.post(url,
+                        headers={"Authorization": f"Bearer {CFG['api_key']}",
+                                 "Content-Type": "application/json"},
+                        json={"model": CFG["api_model"], "max_tokens": 80,
+                              "messages": [{"role": "user", "content": prompt}]})
+                    r.raise_for_status()
+                    raw = r.json()["choices"][0]["message"]["content"].strip()
+            except Exception as e:
+                log.warning(f"resolve API 失败: {e}")
+
+        if raw:
+            try:
+                m = re.search(r'\{[^}]+\}', raw, re.DOTALL)
+                if m:
+                    data = json.loads(m.group())
+                    t = (data.get("title") or title).strip()
+                    a = (data.get("artist") or artist).strip()
+                    log.info(f"歌曲识别: 《{t}》— {a}")
+                    return t or title, a or artist
+            except Exception as e:
+                log.warning(f"resolve 解析失败: {e}")
+
+        return title, artist
+
 
 # ─────────────────────────────────────────────
 # FastAPI
@@ -182,11 +235,12 @@ async def index():
 @app.post("/api/script")
 async def api_script(req: SongReq):
     title  = req.title.strip()
-    artist = req.artist.strip() or "未知歌手"
+    artist = req.artist.strip()
     if not title:
         return {"error": "歌名不能为空"}
-    script = await _gen.generate(title, artist)
-    return {"script": script}
+    resolved_title, resolved_artist = await _gen.resolve(title, artist or "未知歌手")
+    script = await _gen.generate(resolved_title, resolved_artist)
+    return {"title": resolved_title, "artist": resolved_artist, "script": script}
 
 
 @app.post("/api/tts")
@@ -334,8 +388,16 @@ body::after{
 
 .sc-label{
   font-size:.52rem;letter-spacing:.32em;text-transform:uppercase;
-  color:rgba(255,255,255,.22);margin-bottom:20px;
+  color:rgba(255,255,255,.22);margin-bottom:16px;
 }
+.sc-resolved{
+  display:none;margin-bottom:18px;
+  padding:10px 14px;border-radius:10px;
+  background:rgba(232,78,27,.12);border:1px solid rgba(232,78,27,.25);
+  font-size:.78rem;color:rgba(255,255,255,.7);letter-spacing:.04em;
+}
+.sc-resolved.show{display:block;animation:fadeup .28s ease}
+.sc-resolved strong{color:var(--orange-lt);font-weight:600}
 .sc-text{
   color:rgba(255,255,255,.78);font-size:.95rem;
   line-height:1.85;margin-bottom:26px;min-height:60px;
@@ -414,6 +476,7 @@ body::after{
 
   <div class="script-card" id="script-card">
     <div class="sc-label">DJ</div>
+    <div class="sc-resolved" id="sc-resolved"></div>
     <div class="sc-text" id="sc-text"></div>
     <div class="ctrl">
       <button class="btn-play" id="play-btn" onclick="playAudio()" disabled>
@@ -471,6 +534,20 @@ async function generate(){
     const data = await r.json();
     if(data.error){ txt.className='sc-text'; txt.textContent=data.error; return; }
     _script = data.script;
+
+    // 显示识别结果（仅当与原始输入不同时）
+    const resolved = document.getElementById('sc-resolved');
+    const inputTitle  = document.getElementById('title').value.trim();
+    const inputArtist = document.getElementById('artist').value.trim();
+    const nameChanged = data.title !== inputTitle || data.artist !== inputArtist;
+    if(nameChanged && (data.title || data.artist)){
+      resolved.innerHTML = '识别为 <strong>《' + (data.title||'') + '》</strong>'
+        + (data.artist ? ' — <strong>' + data.artist + '</strong>' : '');
+      resolved.classList.add('show');
+    } else {
+      resolved.classList.remove('show');
+    }
+
     txt.className = 'sc-text';
     txt.textContent = _script;
     document.getElementById('play-btn').disabled = false;
